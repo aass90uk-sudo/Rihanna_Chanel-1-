@@ -1,6 +1,8 @@
 import os
 import asyncio
+import json
 from datetime import datetime, time as dtime
+from pathlib import Path
 
 from pytz import timezone
 from hijri_converter import Gregorian
@@ -18,9 +20,12 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
 LOCAL_TZ = timezone("Asia/Riyadh")
+STATE_FILE = Path(".bot_state.json")
+CONTENT_FILE = Path("content.json")
 
 
 # ============================================================
@@ -74,12 +79,53 @@ PROMPTS = {
     "stories_masa":
         "اكتب قصة ملهمة قصيرة جداً من التراث الجزائري القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ.",
 
-    # موعظة إيمانية عامة حتى يبقى النشر الدعوي آمناً وغير موجّه
-    # إلى دعم جماعات أو أعمال عنيفة.
-    "jihad":
-        "اكتب موعظة إيمانية قصيرة ومؤثرة بالفصحى، مندون مقدمات، "
-        "تركز على التقوى والصبر والإخلاص والرحمة والثبات على الطاعة."
 }
+
+
+# ============================================================
+# المحتوى الاحتياطي وحالة التشغيل
+# ============================================================
+
+def _load_fallback_content():
+    try:
+        with CONTENT_FILE.open("r", encoding="utf-8") as content_file:
+            content = json.load(content_file)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"⚠️ تعذر تحميل المحتوى الاحتياطي: {error}")
+        return {}
+
+    return content if isinstance(content, dict) else {}
+
+
+def _fallback_content(prompt_type):
+    values = _load_fallback_content().get(prompt_type, [])
+    if not isinstance(values, list) or not values:
+        return None
+
+    today_index = datetime.now(LOCAL_TZ).timetuple().tm_yday % len(values)
+    value = values[today_index]
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _read_state():
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return state if isinstance(state, dict) else {}
+
+
+def _write_state(state):
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+    with temporary_file.open("w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, ensure_ascii=False)
+    temporary_file.replace(STATE_FILE)
+
+
+def _today_key():
+    return datetime.now(LOCAL_TZ).date().isoformat()
 
 
 # ============================================================
@@ -131,10 +177,17 @@ def _sync_generate(prompt_text):
 
 
 async def generate_content(prompt_type):
-    return await asyncio.to_thread(
-        _sync_generate,
-        PROMPTS[prompt_type]
-    )
+    try:
+        return await asyncio.to_thread(
+            _sync_generate,
+            PROMPTS[prompt_type]
+        )
+    except Exception as error:
+        fallback = _fallback_content(prompt_type)
+        if fallback:
+            print(f"⚠️ تعذر Gemini ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
+            return fallback
+        raise
 
 
 # ============================================================
@@ -253,9 +306,11 @@ async def send_daily_post(
             )
 
         print(f"✅ تم النشر: {label}")
+        return True
 
     except Exception as error:
         print(f"❌ خطأ في النشر ({label}): {error}")
+        return False
 
 
 # ============================================================
@@ -292,61 +347,6 @@ async def job_stories_masa(context: ContextTypes.DEFAULT_TYPE):
         "stories_masa",
         "قصة الليل"
     )
-
-
-async def job_jihad_periodic(context: ContextTypes.DEFAULT_TYPE):
-    await send_daily_post(
-        context.bot,
-        "jihad",
-        "الموعظة الإيمانية الدورية"
-    )
-
-
-# ============================================================
-# الرسالة التعريفية عند الإقلاع
-# ============================================================
-
-async def send_welcome_intro(bot: Bot):
-
-    intro_text = (
-        "📣 **مرحباً بكم في قناة رَيْحَانَةُ المَغْرِبِ الأَوْسَطِ الأَنْدَلُسِيَّة** 📣\n\n"
-        "يسرنا أن نعلن لكم عن تفعيل **نظام الذكاء الاصطناعي الإسلامي** "
-        "لإدارة ونشر محتوى القناة تلقائياً على مدار 24 ساعة بجدول منظم كالتالي:\n\n"
-
-        "⏰ **المحتوى اليومي الثابت:**\n"
-        "☀️ **06:00 صباحاً:** أذكار الصباح المأثورة وبث الطمأنينة.\n"
-        "📜 **12:00 ظهراً:** قصة صباحية وعبرة ملهمة.\n"
-        "🌙 **05:00 مساءً:** أذكار المساء لحفظكم وتحصينكم.\n"
-        "🌌 **10:30 مساءً:** قصة مسائية وتراث دزيري أندلسي.\n\n"
-
-        "⚡ **المحتوى الدوري المتجدد:**\n"
-        "🔄 **كل 3 ساعات بدون توقف:** مواعظ إيمانية مكثفة "
-        "عن التقوى والصبر والإخلاص والرحمة والثبات على الطاعة.\n\n"
-
-        "💬 **ميزة التفاعل الفوري:**\n"
-        "يمكنكم طرح أسئلتكم الشرعية في التعليقات "
-        "وسيقوم البوت بالرد الفقهي الفوري!\n\n"
-
-        "نسأل الله الثبات والنصر والقبول 🤲🌱"
-        f"{footer()}"
-    )
-
-    try:
-        sent = await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=intro_text,
-            parse_mode="Markdown"
-        )
-
-        await bot.pin_chat_message(
-            chat_id=CHANNEL_ID,
-            message_id=sent.message_id
-        )
-
-        print("✅ تم إرسال وتثبيت الرسالة التعريفية!")
-
-    except Exception as error:
-        print(f"خطأ في الرسالة التعريفية: {error}")
 
 
 # ============================================================
@@ -486,20 +486,21 @@ async def post_init(application: Application):
         name="stories_masa"
     )
 
-    # النشر الدوري كل 3 ساعات
-    jq.run_repeating(
-        job_jihad_periodic,
-        interval=10800,
-        first=60,
-        name="jihad_periodic"
-    )
-
     print("✅ تم تسجيل جميع الوظائف في JobQueue.")
 
-    # إرسال الرسالة التعريفية فوراً
-    await send_welcome_intro(bot)
+    state = _read_state()
+    today = _today_key()
+    now_local = datetime.now(LOCAL_TZ)
+    noon_posted_today = state.get("stories_sabah_date") == today
 
-    print("✅ البوت جاهز ويعمل.")
+    if now_local.time() >= dtime(12, 0) and not noon_posted_today:
+        print("📌 استدراك قصة الظهر لليوم...")
+        posted = await send_daily_post(bot, "stories_sabah", "قصة الظهر المستدركة")
+        if posted:
+            state["stories_sabah_date"] = today
+            _write_state(state)
+
+    print("✅ البوت جاهز ويعمل دون إرسال رسالة ترحيبية.")
 
 
 # ============================================================
@@ -517,11 +518,15 @@ def main():
         .build()
     )
 
+    group_filter = filters.ChatType.GROUPS
+    if DISCUSSION_GROUP_ID:
+        group_filter &= filters.Chat(chat_id=int(DISCUSSION_GROUP_ID))
+
     application.add_handler(
         MessageHandler(
             filters.TEXT
             & ~filters.COMMAND
-            & filters.ChatType.GROUPS,
+            & group_filter,
             reply_to_member,
         )
     )
