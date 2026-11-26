@@ -5,11 +5,6 @@ import hashlib
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-# تحميل متغيرات البيئة من ملف .env إن وُجد (للتشغيل المحلي أو على Replit).
-load_dotenv()
-
 import httpx
 from pytz import timezone
 from hijri_converter import Gregorian
