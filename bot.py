@@ -22,6 +22,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
 SUPABASE_URL = (
@@ -315,6 +316,37 @@ def _grok_chat(
     try:
         with httpx.Client(timeout=120) as client:
             response = client.post(GROQ_API_URL, headers=headers, json=payload)
+
+            if response.status_code >= 400 and response.status_code == 400:
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = {}
+
+                error_details = error_body.get("error") if isinstance(error_body, dict) else None
+                if isinstance(error_details, dict) and error_details.get("code") == "model_not_found":
+                    available_response = client.get(GROQ_MODELS_URL, headers=headers)
+                    if available_response.status_code == 200:
+                        available_data = available_response.json()
+                        available_items = available_data.get("data", []) if isinstance(available_data, dict) else []
+                        available_ids = {
+                            item.get("id")
+                            for item in available_items
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)
+                        }
+                        preferred_ids = [
+                            "llama-3.1-8b-instant",
+                            "llama-3.3-70b-versatile",
+                            "openai/gpt-oss-20b",
+                            "openai/gpt-oss-120b",
+                        ]
+                        fallback_model = next(
+                            (model_id for model_id in preferred_ids if model_id in available_ids),
+                            None,
+                        )
+                        if fallback_model and fallback_model != payload["model"]:
+                            payload["model"] = fallback_model
+                            response = client.post(GROQ_API_URL, headers=headers, json=payload)
     except httpx.HTTPError as error:
         raise RuntimeError(f"تعذر الاتصال بخدمة Groq: {error}") from error
 
