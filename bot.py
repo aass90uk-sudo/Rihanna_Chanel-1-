@@ -8,8 +8,6 @@ from pathlib import Path
 import httpx
 from pytz import timezone
 from hijri_converter import Gregorian
-from google import genai
-from google.genai import types
 from telegram import Update, Bot
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -21,8 +19,9 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7")
+XAI_API_URL = "https://api.x.ai/v1/responses"
 DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
 SUPABASE_URL = (
@@ -266,45 +265,78 @@ def _today_key():
 
 
 # ============================================================
-# Gemini
+# Grok
 # ============================================================
 
-def _gemini_chat(
-    prompt_text,
-    system_instruction=None,
-    max_output_tokens=2048,
-    return_response=False,
-):
-    if not GEMINI_KEY:
-        raise RuntimeError("المتغير GEMINI_API_KEY غير مضبوط.")
+def _grok_output_text(response_data: dict) -> str:
+    direct_text = response_data.get("output_text")
+    if isinstance(direct_text, str) and direct_text.strip():
+        return direct_text.strip()
+
+    output = response_data.get("output", [])
+    if not isinstance(output, list):
+        return ""
+
+    text_parts = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+
+    return "".join(text_parts).strip()
+
+
+def _grok_chat(
+    prompt_text: str,
+    system_instruction: str | None = None,
+    max_output_tokens: int = 2048,
+) -> str:
+    if not XAI_API_KEY:
+        raise RuntimeError("المتغير XAI_API_KEY غير مضبوط في Railway.")
+
+    input_messages = []
+    if system_instruction:
+        input_messages.append({"role": "system", "content": system_instruction})
+    input_messages.append({"role": "user", "content": prompt_text})
+
+    payload = {
+        "model": XAI_MODEL,
+        "input": input_messages,
+        "temperature": 0.9,
+        "max_output_tokens": max_output_tokens,
+        "store": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     try:
-        client = genai.Client(api_key=GEMINI_KEY)
+        with httpx.Client(timeout=120) as client:
+            response = client.post(XAI_API_URL, headers=headers, json=payload)
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"تعذر الاتصال بخدمة Grok: {error}") from error
 
-        config = types.GenerateContentConfig(
-            temperature=0.9,
-            max_output_tokens=max_output_tokens,
-        )
+    if response.status_code >= 400:
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = response.text[:300]
+        raise RuntimeError(f"فشل Grok ({response.status_code}): {error_body}")
 
-        if system_instruction:
-            config.system_instruction = system_instruction
+    try:
+        response_data = response.json()
+    except ValueError as error:
+        raise RuntimeError("أعاد Grok استجابة غير صالحة.") from error
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt_text,
-            config=config,
-        )
-
-        text = (response.text or "").strip()
-
-    except Exception as error:
-        raise RuntimeError(f"فشل Gemini: {error}") from error
-
+    text = _grok_output_text(response_data)
     if not text:
-        raise RuntimeError("أعاد Gemini نصاً فارغاً.")
-
-    if return_response:
-        return text, response
+        raise RuntimeError("أعاد Grok نصاً فارغاً.")
 
     return text
 
@@ -326,7 +358,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
 
     for attempt in range(1, 5):
 
-        text = _gemini_chat(
+        text = _grok_chat(
             prompt_text,
             system_instruction=_post_system_instruction(prompt_type),
             max_output_tokens=2048,
@@ -381,7 +413,7 @@ async def generate_content(prompt_type):
         if fallback:
             fallback_hash = content_hash(fallback)
             if fallback_hash not in known_hashes:
-                print(f"⚠️ تعذر Gemini ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
+                print(f"⚠️ تعذر Grok ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
                 return fallback
         raise
 
@@ -417,32 +449,13 @@ def _sync_fiqh_reply(user_name, user_text):
     # إذا لم يكن الناتج مناسباً، تتم إعادة المحاولة.
     for attempt in range(1, 5):
 
-        text, response = _gemini_chat(
+        text = _grok_chat(
             full_prompt,
             max_output_tokens=2048,
-            return_response=True,
         )
 
         last_text = text
         text_length = len(text)
-
-        finish_reason = ""
-
-        try:
-            candidate = response.candidates[0]
-            finish_reason = str(
-                getattr(candidate, "finish_reason", "")
-            ).upper()
-        except Exception:
-            pass
-
-        # إذا كان Gemini قد وصل إلى حد التوكنات، فالرد قد يكون مقطوعاً.
-        if "MAX_TOKENS" in finish_reason:
-            print(
-                f"⚠️ Gemini أوقف الرد بسبب MAX_TOKENS "
-                f"| محاولة {attempt}/4"
-            )
-            continue
 
         # المجال المقصود: 650 إلى 800 حرف.
         if 650 <= text_length <= 800:
