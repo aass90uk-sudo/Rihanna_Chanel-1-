@@ -9,7 +9,6 @@ import httpx
 from pytz import timezone
 from hijri_converter import Gregorian
 from telegram import Bot
-from telegram.error import BadRequest
 from telegram.ext import Application, ContextTypes
 
 
@@ -76,6 +75,15 @@ def get_hijri_date():
 
 def footer():
     return "\n\n🖤 صدقة جارية للأخت «الأندلسية» غفر الله لها."
+
+
+def _clean_post_text(text: str) -> str:
+    return (
+        text.replace("**", "")
+        .replace("__", "")
+        .replace("`", "")
+        .strip()
+    )
 
 
 def content_hash(text: str) -> str:
@@ -193,6 +201,7 @@ def _post_system_instruction(prompt_type: str) -> str:
         "ابتعد عن التكرار والقوالب الجاهزة المستهلكة، "
         "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
         "ولا تُلحق المنشور بأي تاريخ أو هجري أو خاتمة خارجية. "
+        "اكتب النص plain text فقط دون نجوم أو علامات Markdown أو عناوين مزخرفة. "
         + story_rule
     )
 
@@ -471,7 +480,7 @@ async def send_daily_post(
     try:
         print(f"📤 {label}...")
 
-        text = await generate_content(prompt_type)
+        text = _clean_post_text(await generate_content(prompt_type))
 
         post_text = (
             f"{get_hijri_date()}\n\n"
@@ -479,23 +488,10 @@ async def send_daily_post(
             f"{footer()}"
         )
 
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post_text,
-                parse_mode="Markdown",
-            )
-
-        except BadRequest as error:
-            print(
-                f"⚠️ تعذر تنسيق منشور {label} بـ Markdown، "
-                f"سيتم إرساله كنص عادي: {error}"
-            )
-
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post_text
-            )
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=post_text,
+        )
 
         # التسجيل في الذاكرة الدائمة لضمان عدم التكرار مستقبلاً.
         await _supabase_insert_history(content_hash(text), prompt_type, text)
@@ -516,18 +512,10 @@ async def send_fixed_post(
 ):
     try:
         print(f"📤 {label}...")
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=text,
-                parse_mode="Markdown",
-            )
-        except BadRequest as error:
-            print(
-                f"⚠️ تعذر تنسيق منشور {label} بـ Markdown، "
-                f"سيتم إرساله كنص عادي: {error}"
-            )
-            await bot.send_message(chat_id=CHANNEL_ID, text=text)
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+        )
 
         await _supabase_insert_history(content_hash(text), prompt_type, text)
         print(f"✅ تم النشر: {label}")
