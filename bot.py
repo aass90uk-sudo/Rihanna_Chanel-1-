@@ -1,9 +1,16 @@
 import os
 import asyncio
 import json
-from datetime import datetime, time as dtime
+import hashlib
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# تحميل متغيرات البيئة من ملف .env إن وُجد (للتشغيل المحلي أو على Replit).
+load_dotenv()
+
+import httpx
 from pytz import timezone
 from hijri_converter import Gregorian
 from google import genai
@@ -23,9 +30,24 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
+SUPABASE_URL = (
+    os.getenv("SUPABASE_URL")
+    or os.getenv("VITE_SUPABASE_URL")
+    or ""
+).rstrip("/")
+SUPABASE_SERVICE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("VITE_SUPABASE_ANON_KEY")
+)
+
 LOCAL_TZ = timezone("Asia/Riyadh")
 STATE_FILE = Path(".bot_state.json")
 CONTENT_FILE = Path("content.json")
+
+# الطول المطلوب للمنشور: وسط تقريباً (1200 حرف)
+POST_MIN_CHARS = 1100
+POST_MAX_CHARS = 1300
+POST_TARGET_CHARS = 1200
 
 
 # ============================================================
@@ -62,23 +84,143 @@ def footer():
     return "\n\n🖤 صدقة جارية للأخت «الأندلسية» غفر الله لها."
 
 
+def content_hash(text: str) -> str:
+    # نطبّع النص قليلاً حتى لا تتخطى التكرارات بفروق مسافات بسيطة
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# الذاكرة الدائمة (Supabase)
+# ============================================================
+
+async def _supabase_insert_history(h_hash: str, prompt_type: str, content: str):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("⚠️ Supabase غير مضبوط، لن تُحفظ المنشورات في الذاكرة الدائمة.")
+        return
+
+    url = f"{SUPABASE_URL}/rest/v1/posted_history"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    payload = {
+        "content_hash": h_hash,
+        "prompt_type": prompt_type,
+        "content": content,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            if response.status_code not in (200, 201):
+                print(f"⚠️ فشل حفظ المنشور في الذاكرة: {response.status_code} {response.text[:200]}")
+    except Exception as error:
+        print(f"⚠️ خطأ أثناء حفظ المنشور في الذاكرة: {error}")
+
+
+async def _supabase_known_hashes(prompt_type: str) -> set:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return set()
+
+    url = f"{SUPABASE_URL}/rest/v1/posted_history"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={
+                    "select": "content_hash",
+                    "prompt_type": f"eq.{prompt_type}",
+                },
+            )
+            if response.status_code != 200:
+                print(f"⚠️ فشل قراءة الذاكرة الدائمة: {response.status_code}")
+                return set()
+            data = response.json()
+            return {row["content_hash"] for row in data if isinstance(row, dict) and row.get("content_hash")}
+    except Exception as error:
+        print(f"⚠️ خطأ أثناء قراءة الذاكرة الدائمة: {error}")
+        return set()
+
+
+async def _supabase_has_history() -> bool:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        state = _read_state()
+        return bool(state.get("first_run_done"))
+
+    url = f"{SUPABASE_URL}/rest/v1/posted_history"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Range": "0",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={"select": "id", "limit": "1"},
+            )
+            if response.status_code == 200:
+                return bool(response.json())
+            print(f"⚠️ فشل التحقق من الذاكرة: {response.status_code}")
+            return bool(_read_state().get("first_run_done"))
+    except Exception as error:
+        print(f"⚠️ خطأ أثناء التحقق من الذاكرة: {error}")
+        return bool(_read_state().get("first_run_done"))
+
+
 # ============================================================
 # أوامر المحتوى
 # ============================================================
 
+def _post_system_instruction(prompt_type: str) -> str:
+    story_rule = ""
+    if prompt_type == "stories_masa":
+        story_rule = (
+            "قصة من التراث الأندلسي الصالح، "
+            "ولا تذكر نسبها إلى الجزائر أو تسميها قصة المساء أو التراث الجزائري، "
+        )
+
+    return (
+        "أنت كاتب إيماني بليغ وذو أسلوب شعري هادئ وعميق. "
+        "اكتب منشوراً متكاملاً غير مبتور، "
+        "بطول يتراوح بين 1100 و1300 حرف تقريباً (الهدف نحو 1200 حرف)، "
+        "بحيث تكون آخر جملة مكتملة المعنى دون حشو أو إطناب. "
+        "ابتعد عن التكرار والقوالب الجاهزة المستهلكة، "
+        "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
+        "ولا تُلحق المنشور بأي تاريخ أو هجري أو خاتمة خارجية. "
+        + story_rule
+    )
+
+
 PROMPTS = {
     "azkar_sabah":
-        "اكتب منشوراً صباحياً قصيراً يحتوي على أحد أذكار الصباح وفضلها بنبرة إيمانية دافئة.",
+        "اكتب منشوراً صباحياً يحتوي على أحد أذكار الصباح وفضلها بنبرة إيمانية دافئة وشرح موجز.",
 
     "stories_sabah":
-        "اكتب قصة إسلامية جهادية مؤثرة وقعت في بلاد المغرب الإسلامي وعبرة مأثورة ملهمة وقصيرة جداً، واختمها بـ (العبرة من القصة:).",
+        "اكتب قصة إسلامية جهادية مؤثرة وقعت في بلاد المغرب الإسلامي وعبرة مأثورة ملهمة، واختمها بـ (العبرة من القصة:).",
 
     "azkar_masa":
-        "اكتب منشوراً مسائياً قصيراً ومؤثراً يحتوي على أحد أذكار المساء المأثورة وفضلها.",
+        "اكتب منشوراً مسائياً مؤثراً يحتوي على أحد أذكار المساء المأثورة وفضلها وشرح موجز لها.",
 
     "stories_masa":
-        "اكتب قصة ملهمة قصيرة جداً من التراث الجزائري القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ.",
+        "اكتب قصة ملهمة من التراث الأندلسي القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ، واختمها بـ (العبرة من القصة:).",
 
+    "imaani_mouthza":
+        "اكتب موعظة إيمانية شاعرية هادئة وعميقة تفيض فضفضة وطمأنينة، "
+        "وفي خاتمتها دعاء لسكان الجزائر وأهلها بلمسة دزيرية أصيلة "
+        "بأن اللهم اهد الجزائر وأهلها وأمتها إلى الخير والمحبة والسكينة، "
+        "اجعلها كأنها همسة مساء دافئة لقلب متعب يلتفت إلى الله.",
 }
 
 
@@ -145,7 +287,7 @@ def _gemini_chat(
         client = genai.Client(api_key=GEMINI_KEY)
 
         config = types.GenerateContentConfig(
-            temperature=0.75,
+            temperature=0.9,
             max_output_tokens=max_output_tokens,
         )
 
@@ -172,21 +314,80 @@ def _gemini_chat(
     return text
 
 
-def _sync_generate(prompt_text):
-    return _gemini_chat(prompt_text)
+def _trim_to_complete_sentence(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_stop = max(cut.rfind("."), cut.rfind("؟"), cut.rfind("!"), cut.rfind("\n"))
+    if last_stop > max_chars // 2:
+        return cut[:last_stop + 1].strip()
+    return cut.strip()
+
+
+def _sync_generate_post(prompt_text, prompt_type, known_hashes):
+    # لا يتم نشر أي منشور مقصوص أو مكرر.
+    # إذا لم يكن الناتج مناسباً، تتم إعادة المحاولة.
+    last_text = ""
+
+    for attempt in range(1, 5):
+
+        text = _gemini_chat(
+            prompt_text,
+            system_instruction=_post_system_instruction(prompt_type),
+            max_output_tokens=2048,
+        )
+
+        last_text = text
+        text_length = len(text)
+
+        if content_hash(text) in known_hashes:
+            print(f"⚠️ منشور مكرر (محاولة {attempt}/4)، سيتم طلب نص جديد.")
+            continue
+
+        # المجال المقصود: 1100 إلى 1300 حرف تقريباً.
+        if POST_MIN_CHARS <= text_length <= POST_MAX_CHARS:
+            print(f"✅ منشور كامل جديد: {text_length} حرف | محاولة {attempt}")
+            return text
+
+        if POST_MAX_CHARS < text_length:
+            trimmed = _trim_to_complete_sentence(text, POST_TARGET_CHARS)
+            if POST_MIN_CHARS <= len(trimmed) <= POST_MAX_CHARS:
+                print(f"✅ تم تشذيب منشور طويل إلى {len(trimmed)} حرف | محاولة {attempt}")
+                return trimmed
+
+        print(f"⚠️ طول غير مناسب: {text_length} حرف | محاولة {attempt}/4")
+
+    # كمحل أخير، نُخرج أطول نص وصلنا إليه غير مكرر ومكتمل الجُمل.
+    if content_hash(last_text) not in known_hashes:
+        if len(last_text) > POST_MAX_CHARS:
+            last_text = _trim_to_complete_sentence(last_text, POST_TARGET_CHARS)
+        print(f"⚠️ إرجاع أفضل نص متاح بعد المحاولات: {len(last_text)} حرف.")
+        return last_text
+
+    raise RuntimeError(
+        "تعذر إنشاء منشور جديد غير مكرر بالطول المطلوب. "
+        f"آخر طول: {len(last_text)} حرف."
+    )
 
 
 async def generate_content(prompt_type):
+    known_hashes = await _supabase_known_hashes(prompt_type)
+    prompt_text = PROMPTS[prompt_type]
+
     try:
         return await asyncio.to_thread(
-            _sync_generate,
-            PROMPTS[prompt_type]
+            _sync_generate_post,
+            prompt_text,
+            prompt_type,
+            known_hashes,
         )
     except Exception as error:
         fallback = _fallback_content(prompt_type)
         if fallback:
-            print(f"⚠️ تعذر Gemini ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
-            return fallback
+            fallback_hash = content_hash(fallback)
+            if fallback_hash not in known_hashes:
+                print(f"⚠️ تعذر Gemini ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
+                return fallback
         raise
 
 
@@ -304,6 +505,9 @@ async def send_daily_post(
                 chat_id=CHANNEL_ID,
                 text=post_text
             )
+
+        # التسجيل في الذاكرة الدائمة لضمان عدم التكرار مستقبلاً.
+        await _supabase_insert_history(content_hash(text), prompt_type, text)
 
         print(f"✅ تم النشر: {label}")
         return True
@@ -488,10 +692,23 @@ async def post_init(application: Application):
 
     print("✅ تم تسجيل جميع الوظائف في JobQueue.")
 
-    state = _read_state()
     today = _today_key()
+    state = _read_state()
     now_local = datetime.now(LOCAL_TZ)
+
+    has_history = await _supabase_has_history()
+    first_run_imaani_done = state.get("first_run_imaani_date") == today
     noon_posted_today = state.get("stories_sabah_date") == today
+
+    # في أول تشغيل فقط: موعظة إيمانية شاعرية ودعاء لأهل الجزائر بلمسة دزيرية.
+    # لا ترحيب ولا رسالة جدولة مثبتة.
+    if not has_history and not first_run_imaani_done:
+        print("📌 أول تشغيل: نشر الموعظة الإيمانية والدعاء لأهل الجزائر...")
+        posted = await send_daily_post(bot, "imaani_mouthza", "الموعظة الإيمانية الأولى")
+        if posted:
+            state["first_run_imaani_date"] = today
+            state["first_run_done"] = True
+            _write_state(state)
 
     if now_local.time() >= dtime(12, 0) and not noon_posted_today:
         print("📌 استدراك قصة الظهر لليوم...")
