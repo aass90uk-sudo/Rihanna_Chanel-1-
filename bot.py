@@ -19,9 +19,9 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7")
-XAI_API_URL = "https://api.x.ai/v1/responses"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
 SUPABASE_URL = (
@@ -273,20 +273,17 @@ def _grok_output_text(response_data: dict) -> str:
     if isinstance(direct_text, str) and direct_text.strip():
         return direct_text.strip()
 
-    output = response_data.get("output", [])
-    if not isinstance(output, list):
+    choices = response_data.get("choices", [])
+    if not isinstance(choices, list):
         return ""
 
     text_parts = []
-    for item in output:
-        if not isinstance(item, dict):
+    for choice in choices:
+        if not isinstance(choice, dict):
             continue
-        content = item.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                text_parts.append(part["text"])
+        message = choice.get("message", {})
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            text_parts.append(message["content"])
 
     return "".join(text_parts).strip()
 
@@ -296,8 +293,8 @@ def _grok_chat(
     system_instruction: str | None = None,
     max_output_tokens: int = 2048,
 ) -> str:
-    if not XAI_API_KEY:
-        raise RuntimeError("المتغير XAI_API_KEY غير مضبوط في Railway.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("المتغير GROQ_API_KEY غير مضبوط في Railway.")
 
     input_messages = []
     if system_instruction:
@@ -305,38 +302,37 @@ def _grok_chat(
     input_messages.append({"role": "user", "content": prompt_text})
 
     payload = {
-        "model": XAI_MODEL,
-        "input": input_messages,
+        "model": GROQ_MODEL,
+        "messages": input_messages,
         "temperature": 0.9,
-        "max_output_tokens": max_output_tokens,
-        "store": False,
+        "max_tokens": max_output_tokens,
     }
     headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
 
     try:
         with httpx.Client(timeout=120) as client:
-            response = client.post(XAI_API_URL, headers=headers, json=payload)
+            response = client.post(GROQ_API_URL, headers=headers, json=payload)
     except httpx.HTTPError as error:
-        raise RuntimeError(f"تعذر الاتصال بخدمة Grok: {error}") from error
+        raise RuntimeError(f"تعذر الاتصال بخدمة Groq: {error}") from error
 
     if response.status_code >= 400:
         try:
             error_body = response.json()
         except ValueError:
             error_body = response.text[:300]
-        raise RuntimeError(f"فشل Grok ({response.status_code}): {error_body}")
+        raise RuntimeError(f"فشل Groq ({response.status_code}): {error_body}")
 
     try:
         response_data = response.json()
     except ValueError as error:
-        raise RuntimeError("أعاد Grok استجابة غير صالحة.") from error
+        raise RuntimeError("أعاد Groq استجابة غير صالحة.") from error
 
     text = _grok_output_text(response_data)
     if not text:
-        raise RuntimeError("أعاد Grok نصاً فارغاً.")
+        raise RuntimeError("أعاد Groq نصاً فارغاً.")
 
     return text
 
@@ -413,7 +409,7 @@ async def generate_content(prompt_type):
         if fallback:
             fallback_hash = content_hash(fallback)
             if fallback_hash not in known_hashes:
-                print(f"⚠️ تعذر Grok ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
+                print(f"⚠️ تعذر Groq ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
                 return fallback
         raise
 
@@ -480,6 +476,20 @@ def _sync_fiqh_reply(user_name, user_text):
 # إرسال المنشورات للقناة
 # ============================================================
 
+TAMANRASSET_POST = (
+    "على طريق طويل امتدّ في قلب تمنراست، توقفت تسع نبضات فجأة، "
+    "وانطفأت تسعة أحلام كانت تعانق الأفق. لم يكن مجرد اصطدام عابر "
+    "على الطريق الوطني رقم 1، بل كان غياباً مباغتاً ترك خلفه بيوتاً "
+    "ينهشها الصمت، وقلوباً تبحث عن دفء رحل ولن يعود.\n\n"
+    "كيف لطريق يجمع الأحبة أن يتحول في لحظة إلى ممرّ للوداع الأخير؟\n\n"
+    "رحلوا وتركوا خلفهم أثراً لا تمحوه الأيام، ووجعاً يعتصر قلب الجزائر "
+    "من أقصاها إلى أقصاها. اللهم اجعل قسوة تلك اللحظات برداً وسلاماً "
+    "على أرواحهم، واغفر لهم، واجعل مثواهم جنات النعيم، واربط على قلوب "
+    "أمهاتهم وآبائهم وأحبّتهم بصبر يوازي حجم الفقد.\n\n"
+    "إنا لله وإنا إليه راجعون.. 🇩🇿💔"
+)
+
+
 async def send_daily_post(
     bot: Bot,
     prompt_type: str,
@@ -520,6 +530,35 @@ async def send_daily_post(
         print(f"✅ تم النشر: {label}")
         return True
 
+    except Exception as error:
+        print(f"❌ خطأ في النشر ({label}): {error}")
+        return False
+
+
+async def send_fixed_post(
+    bot: Bot,
+    text: str,
+    prompt_type: str,
+    label: str,
+):
+    try:
+        print(f"📤 {label}...")
+        try:
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except BadRequest as error:
+            print(
+                f"⚠️ تعذر تنسيق منشور {label} بـ Markdown، "
+                f"سيتم إرساله كنص عادي: {error}"
+            )
+            await bot.send_message(chat_id=CHANNEL_ID, text=text)
+
+        await _supabase_insert_history(content_hash(text), prompt_type, text)
+        print(f"✅ تم النشر: {label}")
+        return True
     except Exception as error:
         print(f"❌ خطأ في النشر ({label}): {error}")
         return False
@@ -706,10 +745,10 @@ async def post_init(application: Application):
 
     has_history = await _supabase_has_history()
     first_run_imaani_done = state.get("first_run_imaani_date") == today
+    tamanrasset_posted_today = state.get("tamanrasset_post_date") == today
     noon_posted_today = state.get("stories_sabah_date") == today
 
-    # في أول تشغيل فقط: موعظة إيمانية شاعرية ودعاء لأهل الجزائر بلمسة دزيرية.
-    # لا ترحيب ولا رسالة جدولة مثبتة.
+    # في أول تشغيل فقط: موعظة إيمانية، ثم منشور تمنراست مباشرة بعدها.
     if not has_history and not first_run_imaani_done:
         print("📌 أول تشغيل: نشر الموعظة الإيمانية والدعاء لأهل الجزائر...")
         posted = await send_daily_post(bot, "imaani_mouthza", "الموعظة الإيمانية الأولى")
@@ -717,6 +756,18 @@ async def post_init(application: Application):
             state["first_run_imaani_date"] = today
             state["first_run_done"] = True
             _write_state(state)
+
+    if first_run_imaani_done or state.get("first_run_imaani_date") == today:
+        if not tamanrasset_posted_today:
+            posted = await send_fixed_post(
+                bot,
+                TAMANRASSET_POST,
+                "tamanrasset_accident",
+                "منشور ضحايا حادث تمنراست",
+            )
+            if posted:
+                state["tamanrasset_post_date"] = today
+                _write_state(state)
 
     if now_local.time() >= dtime(12, 0) and not noon_posted_today:
         print("📌 استدراك قصة الظهر لليوم...")
