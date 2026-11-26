@@ -2,6 +2,8 @@ import os
 import asyncio
 import json
 import hashlib
+import re
+import unicodedata
 from datetime import datetime, time as dtime
 from pathlib import Path
 
@@ -28,13 +30,9 @@ SUPABASE_URL = (
     or os.getenv("VITE_SUPABASE_URL")
     or ""
 ).rstrip("/")
-SUPABASE_SERVICE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("VITE_SUPABASE_ANON_KEY")
-)
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 LOCAL_TZ = timezone("Asia/Riyadh")
-STATE_FILE = Path(".bot_state.json")
 CONTENT_FILE = Path("content.json")
 
 # الطول المطلوب للمنشور: وسط تقريباً (1200 حرف)
@@ -74,21 +72,22 @@ def get_hijri_date():
 
 
 def footer():
-    return "\n\n🖤 صدقة جارية للأخت «الأندلسية» غفر الله لها."
+    return "\n\n🖤 صدقة جارية لأمـي جنتي «الأندلسية» غ ـفر الله لها."
 
 
 def _clean_post_text(text: str) -> str:
-    return (
-        text.replace("**", "")
-        .replace("__", "")
-        .replace("`", "")
-        .strip()
-    )
+    cleaned = unicodedata.normalize("NFC", text)
+    cleaned = re.sub(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]", "", cleaned)
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    cleaned = re.sub(r"([\u064B-\u065F\u0670])\1+", r"\1", cleaned)
+    cleaned = re.sub(r"(?<![\u0621-\u064A])[\u064B-\u065F\u0670]+(?![\u0621-\u064A])", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def content_hash(text: str) -> str:
-    # نطبّع النص قليلاً حتى لا تتخطى التكرارات بفروق مسافات بسيطة
-    normalized = " ".join(text.split())
+    normalized = " ".join(_clean_post_text(text).split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -96,10 +95,36 @@ def content_hash(text: str) -> str:
 # الذاكرة الدائمة (Supabase)
 # ============================================================
 
-async def _supabase_insert_history(h_hash: str, prompt_type: str, content: str):
+async def _supabase_claim_post(h_hash: str, prompt_type: str, content: str) -> bool:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("⚠️ Supabase غير مضبوط، لن تُحفظ المنشورات في الذاكرة الدائمة.")
-        return
+        raise RuntimeError("ذاكرة Supabase الدائمة غير مضبوطة في Railway.")
+
+    url = f"{SUPABASE_URL}/rest/v1/rpc/claim_post_content"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "p_content_hash": h_hash,
+        "p_prompt_type": prompt_type,
+        "p_content": content,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            if response.status_code != 200:
+                raise RuntimeError(f"فشل حجز المنشور في الذاكرة: {response.status_code}")
+            result = response.json()
+            return result is True
+    except (httpx.HTTPError, ValueError) as error:
+        raise RuntimeError(f"تعذر حجز المنشور في الذاكرة: {error}") from error
+
+
+async def _supabase_mark_posted(h_hash: str):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise RuntimeError("ذاكرة Supabase الدائمة غير مضبوطة في Railway.")
 
     url = f"{SUPABASE_URL}/rest/v1/posted_history"
     headers = {
@@ -108,19 +133,18 @@ async def _supabase_insert_history(h_hash: str, prompt_type: str, content: str):
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
-    payload = {
-        "content_hash": h_hash,
-        "prompt_type": prompt_type,
-        "content": content,
-    }
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            if response.status_code not in (200, 201):
-                print(f"⚠️ فشل حفظ المنشور في الذاكرة: {response.status_code} {response.text[:200]}")
-    except Exception as error:
-        print(f"⚠️ خطأ أثناء حفظ المنشور في الذاكرة: {error}")
+            response = await client.patch(
+                url,
+                headers=headers,
+                params={"content_hash": f"eq.{h_hash}"},
+                json={"status": "posted", "posted_at": datetime.utcnow().isoformat()},
+            )
+            if response.status_code not in (200, 204):
+                raise RuntimeError(f"فشل تثبيت حالة المنشور: {response.status_code}")
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"تعذر تثبيت حالة المنشور: {error}") from error
 
 
 async def _supabase_known_hashes(prompt_type: str) -> set:
@@ -141,6 +165,7 @@ async def _supabase_known_hashes(prompt_type: str) -> set:
                 params={
                     "select": "content_hash",
                     "prompt_type": f"eq.{prompt_type}",
+                    "status": "eq.posted",
                 },
             )
             if response.status_code != 200:
@@ -151,34 +176,6 @@ async def _supabase_known_hashes(prompt_type: str) -> set:
     except Exception as error:
         print(f"⚠️ خطأ أثناء قراءة الذاكرة الدائمة: {error}")
         return set()
-
-
-async def _supabase_has_history() -> bool:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        state = _read_state()
-        return bool(state.get("first_run_done"))
-
-    url = f"{SUPABASE_URL}/rest/v1/posted_history"
-    headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Range": "0",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                url,
-                headers=headers,
-                params={"select": "id", "limit": "1"},
-            )
-            if response.status_code == 200:
-                return bool(response.json())
-            print(f"⚠️ فشل التحقق من الذاكرة: {response.status_code}")
-            return bool(_read_state().get("first_run_done"))
-    except Exception as error:
-        print(f"⚠️ خطأ أثناء التحقق من الذاكرة: {error}")
-        return bool(_read_state().get("first_run_done"))
 
 
 # ============================================================
@@ -219,11 +216,6 @@ PROMPTS = {
     "stories_masa":
         "اكتب قصة ملهمة من التراث الأندلسي القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ، واختمها بـ (العبرة من القصة:).",
 
-    "imaani_mouthza":
-        "اكتب موعظة إيمانية شاعرية هادئة وعميقة تفيض فضفضة وطمأنينة، "
-        "وفي خاتمتها دعاء لسكان الجزائر وأهلها بلمسة دزيرية أصيلة "
-        "بأن اللهم اهد الجزائر وأهلها وأمتها إلى الخير والمحبة والسكينة، "
-        "اجعلها كأنها همسة مساء دافئة لقلب متعب يلتفت إلى الله.",
 }
 
 
@@ -249,28 +241,7 @@ def _fallback_content(prompt_type):
 
     today_index = datetime.now(LOCAL_TZ).timetuple().tm_yday % len(values)
     value = values[today_index]
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _read_state():
-    try:
-        with STATE_FILE.open("r", encoding="utf-8") as state_file:
-            state = json.load(state_file)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    return state if isinstance(state, dict) else {}
-
-
-def _write_state(state):
-    temporary_file = STATE_FILE.with_suffix(".tmp")
-    with temporary_file.open("w", encoding="utf-8") as state_file:
-        json.dump(state, state_file, ensure_ascii=False)
-    temporary_file.replace(STATE_FILE)
-
-
-def _today_key():
-    return datetime.now(LOCAL_TZ).date().isoformat()
+    return _clean_post_text(value) if isinstance(value, str) and value.strip() else None
 
 
 # ============================================================
@@ -400,6 +371,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
             max_output_tokens=2048,
         )
 
+        text = _clean_post_text(text)
         last_text = text
         text_length = len(text)
 
@@ -458,20 +430,6 @@ async def generate_content(prompt_type):
 # إرسال المنشورات للقناة
 # ============================================================
 
-TAMANRASSET_POST = (
-    "على طريق طويل امتدّ في قلب تمنراست، توقفت تسع نبضات فجأة، "
-    "وانطفأت تسعة أحلام كانت تعانق الأفق. لم يكن مجرد اصطدام عابر "
-    "على الطريق الوطني رقم 1، بل كان غياباً مباغتاً ترك خلفه بيوتاً "
-    "ينهشها الصمت، وقلوباً تبحث عن دفء رحل ولن يعود.\n\n"
-    "كيف لطريق يجمع الأحبة أن يتحول في لحظة إلى ممرّ للوداع الأخير؟\n\n"
-    "رحلوا وتركوا خلفهم أثراً لا تمحوه الأيام، ووجعاً يعتصر قلب الجزائر "
-    "من أقصاها إلى أقصاها. اللهم اجعل قسوة تلك اللحظات برداً وسلاماً "
-    "على أرواحهم، واغفر لهم، واجعل مثواهم جنات النعيم، واربط على قلوب "
-    "أمهاتهم وآبائهم وأحبّتهم بصبر يوازي حجم الفقد.\n\n"
-    "إنا لله وإنا إليه راجعون.. 🇩🇿💔"
-)
-
-
 async def send_daily_post(
     bot: Bot,
     prompt_type: str,
@@ -488,38 +446,22 @@ async def send_daily_post(
             f"{footer()}"
         )
 
+        post_hash = content_hash(text)
+        claimed = await _supabase_claim_post(post_hash, prompt_type, text)
+        if not claimed:
+            print(f"⚠️ تم منع منشور مكرر قبل الإرسال: {label}")
+            return False
+
         await bot.send_message(
             chat_id=CHANNEL_ID,
             text=post_text,
         )
 
-        # التسجيل في الذاكرة الدائمة لضمان عدم التكرار مستقبلاً.
-        await _supabase_insert_history(content_hash(text), prompt_type, text)
+        await _supabase_mark_posted(post_hash)
 
         print(f"✅ تم النشر: {label}")
         return True
 
-    except Exception as error:
-        print(f"❌ خطأ في النشر ({label}): {error}")
-        return False
-
-
-async def send_fixed_post(
-    bot: Bot,
-    text: str,
-    prompt_type: str,
-    label: str,
-):
-    try:
-        print(f"📤 {label}...")
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
-        )
-
-        await _supabase_insert_history(content_hash(text), prompt_type, text)
-        print(f"✅ تم النشر: {label}")
-        return True
     except Exception as error:
         print(f"❌ خطأ في النشر ({label}): {error}")
         return False
@@ -627,44 +569,7 @@ async def post_init(application: Application):
 
     print("✅ تم تسجيل جميع الوظائف في JobQueue.")
 
-    today = _today_key()
-    state = _read_state()
-    now_local = datetime.now(LOCAL_TZ)
-
-    has_history = await _supabase_has_history()
-    first_run_imaani_done = state.get("first_run_imaani_date") == today
-    tamanrasset_posted_today = state.get("tamanrasset_post_date") == today
-    noon_posted_today = state.get("stories_sabah_date") == today
-
-    # في أول تشغيل فقط: موعظة إيمانية، ثم منشور تمنراست مباشرة بعدها.
-    if not has_history and not first_run_imaani_done:
-        print("📌 أول تشغيل: نشر الموعظة الإيمانية والدعاء لأهل الجزائر...")
-        posted = await send_daily_post(bot, "imaani_mouthza", "الموعظة الإيمانية الأولى")
-        if posted:
-            state["first_run_imaani_date"] = today
-            state["first_run_done"] = True
-            _write_state(state)
-
-    if first_run_imaani_done or state.get("first_run_imaani_date") == today:
-        if not tamanrasset_posted_today:
-            posted = await send_fixed_post(
-                bot,
-                TAMANRASSET_POST,
-                "tamanrasset_accident",
-                "منشور ضحايا حادث تمنراست",
-            )
-            if posted:
-                state["tamanrasset_post_date"] = today
-                _write_state(state)
-
-    if now_local.time() >= dtime(12, 0) and not noon_posted_today:
-        print("📌 استدراك قصة الظهر لليوم...")
-        posted = await send_daily_post(bot, "stories_sabah", "قصة الظهر المستدركة")
-        if posted:
-            state["stories_sabah_date"] = today
-            _write_state(state)
-
-    print("✅ البوت جاهز ويعمل دون إرسال رسالة ترحيبية.")
+    print("✅ البوت جاهز ويعمل بجدولة المنشورات فقط دون نشر فوري عند الإقلاع.")
 
 
 # ============================================================
