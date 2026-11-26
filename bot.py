@@ -3,6 +3,7 @@ import asyncio
 import json
 import hashlib
 import re
+import tempfile
 import unicodedata
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -25,15 +26,13 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
-SUPABASE_URL = (
-    os.getenv("SUPABASE_URL")
-    or os.getenv("VITE_SUPABASE_URL")
-    or ""
-).rstrip("/")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
 LOCAL_TZ = timezone("Asia/Riyadh")
 CONTENT_FILE = Path("content.json")
+VOLUME_MOUNT_PATH = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
+MEMORY_FILE = VOLUME_MOUNT_PATH / "posted_history.json"
+MEMORY_LOCK = asyncio.Lock()
+SPECIAL_POST_TYPE = "special_tamanrasset"
+SPECIAL_POST_KEY = "special_tamanrasset_once"
 
 # الطول المطلوب للمنشور: وسط تقريباً (1200 حرف)
 POST_MIN_CHARS = 1100
@@ -92,90 +91,142 @@ def content_hash(text: str) -> str:
 
 
 # ============================================================
-# الذاكرة الدائمة (Supabase)
+# الذاكرة الدائمة على Railway Volume
 # ============================================================
 
-async def _supabase_claim_post(h_hash: str, prompt_type: str, content: str) -> bool:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("ذاكرة Supabase الدائمة غير مضبوطة في Railway.")
+def _empty_memory():
+    return {"version": 1, "posts": []}
 
-    url = f"{SUPABASE_URL}/rest/v1/rpc/claim_post_content"
-    headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "p_content_hash": h_hash,
-        "p_prompt_type": prompt_type,
-        "p_content": content,
-    }
 
+def _load_memory():
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            if response.status_code != 200:
-                raise RuntimeError(f"فشل حجز المنشور في الذاكرة: {response.status_code}")
-            result = response.json()
-            return result is True
-    except (httpx.HTTPError, ValueError) as error:
-        raise RuntimeError(f"تعذر حجز المنشور في الذاكرة: {error}") from error
+        with MEMORY_FILE.open("r", encoding="utf-8") as memory_file:
+            memory = json.load(memory_file)
+    except FileNotFoundError:
+        return _empty_memory()
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"تعذر قراءة ملف الذاكرة الدائمة: {error}") from error
+
+    if not isinstance(memory, dict) or not isinstance(memory.get("posts"), list):
+        raise RuntimeError("ملف الذاكرة الدائمة غير صالح.")
+    return memory
 
 
-async def _supabase_mark_posted(h_hash: str):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("ذاكرة Supabase الدائمة غير مضبوطة في Railway.")
-
-    url = f"{SUPABASE_URL}/rest/v1/posted_history"
-    headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
+def _save_memory(memory):
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.patch(
-                url,
-                headers=headers,
-                params={"content_hash": f"eq.{h_hash}"},
-                json={"status": "posted", "posted_at": datetime.utcnow().isoformat()},
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix="posted_history-",
+            suffix=".tmp",
+            dir=MEMORY_FILE.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as memory_file:
+            json.dump(memory, memory_file, ensure_ascii=False, indent=2)
+            memory_file.flush()
+            os.fsync(memory_file.fileno())
+        os.replace(temporary_path, MEMORY_FILE)
+    except OSError as error:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+        raise RuntimeError(f"تعذر حفظ الذاكرة الدائمة داخل Volume: {error}") from error
+
+
+async def _memory_known_hashes(prompt_type: str) -> set[str]:
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        return {
+            record["content_hash"]
+            for record in memory["posts"]
+            if isinstance(record, dict)
+            and record.get("prompt_type") == prompt_type
+            and record.get("status") == "posted"
+            and record.get("content_hash")
+        }
+
+
+async def _memory_has_posted_today(prompt_type: str) -> bool:
+    today_key = f"{prompt_type}:{datetime.now(LOCAL_TZ).date().isoformat()}"
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        return any(
+            isinstance(record, dict)
+            and record.get("claim_key") == today_key
+            and record.get("status") == "posted"
+            for record in memory["posts"]
+        )
+
+
+async def _memory_claim_post(
+    h_hash: str,
+    prompt_type: str,
+    content: str,
+    claim_key: str,
+) -> bool:
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        already_claimed = any(
+            isinstance(record, dict)
+            and record.get("claim_key") == claim_key
+            and record.get("status") in {"claimed", "posted"}
+            for record in memory["posts"]
+        )
+        duplicate_content = any(
+            isinstance(record, dict)
+            and record.get("prompt_type") == prompt_type
+            and record.get("content_hash") == h_hash
+            and record.get("status") in {"claimed", "posted"}
+            for record in memory["posts"]
+        )
+        if already_claimed or duplicate_content:
+            return False
+
+        memory["posts"].append(
+            {
+                "claim_key": claim_key,
+                "content_hash": h_hash,
+                "prompt_type": prompt_type,
+                "content": content,
+                "status": "claimed",
+                "claimed_at": datetime.now(LOCAL_TZ).isoformat(),
+            }
+        )
+        _save_memory(memory)
+        return True
+
+
+async def _memory_mark_posted(h_hash: str, prompt_type: str):
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        for record in reversed(memory["posts"]):
+            if (
+                isinstance(record, dict)
+                and record.get("content_hash") == h_hash
+                and record.get("prompt_type") == prompt_type
+                and record.get("status") == "claimed"
+            ):
+                record["status"] = "posted"
+                record["posted_at"] = datetime.now(LOCAL_TZ).isoformat()
+                _save_memory(memory)
+                return
+        raise RuntimeError("تعذر تثبيت المنشور في الذاكرة الدائمة.")
+
+
+async def _memory_release_claim(h_hash: str, prompt_type: str):
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        memory["posts"] = [
+            record
+            for record in memory["posts"]
+            if not (
+                isinstance(record, dict)
+                and record.get("content_hash") == h_hash
+                and record.get("prompt_type") == prompt_type
+                and record.get("status") == "claimed"
             )
-            if response.status_code not in (200, 204):
-                raise RuntimeError(f"فشل تثبيت حالة المنشور: {response.status_code}")
-    except httpx.HTTPError as error:
-        raise RuntimeError(f"تعذر تثبيت حالة المنشور: {error}") from error
-
-
-async def _supabase_known_hashes(prompt_type: str) -> set:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return set()
-
-    url = f"{SUPABASE_URL}/rest/v1/posted_history"
-    headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                url,
-                headers=headers,
-                params={
-                    "select": "content_hash",
-                    "prompt_type": f"eq.{prompt_type}",
-                    "status": "eq.posted",
-                },
-            )
-            if response.status_code != 200:
-                print(f"⚠️ فشل قراءة الذاكرة الدائمة: {response.status_code}")
-                return set()
-            data = response.json()
-            return {row["content_hash"] for row in data if isinstance(row, dict) and row.get("content_hash")}
-    except Exception as error:
-        print(f"⚠️ خطأ أثناء قراءة الذاكرة الدائمة: {error}")
-        return set()
+        ]
+        _save_memory(memory)
 
 
 # ============================================================
@@ -215,8 +266,20 @@ PROMPTS = {
 
     "stories_masa":
         "اكتب قصة ملهمة من التراث الأندلسي القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ، واختمها بـ (العبرة من القصة:).",
-
 }
+
+
+SPECIAL_POST_TEXT = (
+    "في بعض الليالي يمرّ الحزن على القلوب ثقيلاً، فنحتاج أن نتذكر أن الله أرحم بنا من أنفسنا، "
+    "وأن رحمته لا يغلقها موت ولا يحدّها ألم. إنّا لله وإنّا إليه راجعون، ولا نقول إلا ما يرضي ربنا.\n\n"
+    "اللهم ارحم ضحايا حادث السير الأليم في تمنراست، واغفر لهم، ونوّر قبورهم، واجعل ما أصابهم رفعةً "
+    "في درجاتهم وتكفيراً لذنوبهم. اللهم اربط على قلوب أهليهم، وأنزل عليهم سكينتك وصبرك الجميل، "
+    "واجبر كسرهم جبراً يليق بكرمك. اللهم اشف المصابين شفاءً تاماً، وألطف بهم، وردّهم إلى أهلهم سالمين معافين.\n\n"
+    "يا من أثقلتك مصيبة أو أوجعك فراق، لا تظن أن دمعتك غائبة عن علم الله؛ هو يسمع الدعاء قبل أن تنطق به، "
+    "ويرى القلب حين لا يراه أحد. فاهدأ، واستودع أحبابك عند أرحم الراحمين، وأكثر من قول: "
+    "اللهم آجرنا في مصيبتنا واخلف لنا خيراً منها. سيأتي لطف الله، ولو بعد حين، وسيجعل في الصبر نوراً "
+    "وفي التسليم طمأنينةً لا يمنحها شيء سواه."
+)
 
 
 # ============================================================
@@ -406,7 +469,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
 
 
 async def generate_content(prompt_type):
-    known_hashes = await _supabase_known_hashes(prompt_type)
+    known_hashes = await _memory_known_hashes(prompt_type)
     prompt_text = PROMPTS[prompt_type]
 
     try:
@@ -430,40 +493,58 @@ async def generate_content(prompt_type):
 # إرسال المنشورات للقناة
 # ============================================================
 
+async def _send_claimed_post(
+    bot: Bot,
+    prompt_type: str,
+    label: str,
+    text: str,
+    claim_key: str,
+) -> bool:
+    post_hash = content_hash(text)
+    claimed = await _memory_claim_post(post_hash, prompt_type, text, claim_key)
+    if not claimed:
+        print(f"⚠️ تم منع منشور مكرر قبل الإرسال: {label}")
+        return False
+
+    post_text = f"{get_hijri_date()}\n\n{text}{footer()}"
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=post_text)
+    except Exception:
+        await _memory_release_claim(post_hash, prompt_type)
+        raise
+
+    await _memory_mark_posted(post_hash, prompt_type)
+    print(f"✅ تم النشر: {label}")
+    return True
+
+
 async def send_daily_post(
     bot: Bot,
     prompt_type: str,
-    label: str
-):
+    label: str,
+) -> bool:
     try:
         print(f"📤 {label}...")
-
         text = _clean_post_text(await generate_content(prompt_type))
-
-        post_text = (
-            f"{get_hijri_date()}\n\n"
-            f"{text}"
-            f"{footer()}"
-        )
-
-        post_hash = content_hash(text)
-        claimed = await _supabase_claim_post(post_hash, prompt_type, text)
-        if not claimed:
-            print(f"⚠️ تم منع منشور مكرر قبل الإرسال: {label}")
-            return False
-
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=post_text,
-        )
-
-        await _supabase_mark_posted(post_hash)
-
-        print(f"✅ تم النشر: {label}")
-        return True
-
+        claim_key = f"{prompt_type}:{datetime.now(LOCAL_TZ).date().isoformat()}"
+        return await _send_claimed_post(bot, prompt_type, label, text, claim_key)
     except Exception as error:
         print(f"❌ خطأ في النشر ({label}): {error}")
+        return False
+
+
+async def send_special_post(bot: Bot) -> bool:
+    try:
+        print("📤 الموعظة الخاصة والدعاء لأهالي حادث تمنراست...")
+        return await _send_claimed_post(
+            bot,
+            SPECIAL_POST_TYPE,
+            "الموعظة الخاصة والدعاء لأهالي حادث تمنراست",
+            SPECIAL_POST_TEXT,
+            SPECIAL_POST_KEY,
+        )
+    except Exception as error:
+        print(f"❌ خطأ في المنشور الخاص: {error}")
         return False
 
 
@@ -501,6 +582,17 @@ async def job_stories_masa(context: ContextTypes.DEFAULT_TYPE):
         "stories_masa",
         "قصة الليل"
     )
+
+
+async def job_special_once(context: ContextTypes.DEFAULT_TYPE):
+    await send_special_post(context.bot)
+
+
+async def job_azkar_masa_catchup(context: ContextTypes.DEFAULT_TYPE):
+    if await _memory_has_posted_today("azkar_masa"):
+        print("✅ أذكار المساء منشورة اليوم، لا حاجة لمنشور تعويضي.")
+        return
+    await job_azkar_masa(context)
 
 
 # ============================================================
@@ -567,9 +659,22 @@ async def post_init(application: Application):
         name="stories_masa"
     )
 
-    print("✅ تم تسجيل جميع الوظائف في JobQueue.")
+    jq.run_once(
+        job_special_once,
+        when=10,
+        name=SPECIAL_POST_KEY,
+    )
 
-    print("✅ البوت جاهز ويعمل بجدولة المنشورات فقط دون نشر فوري عند الإقلاع.")
+    now_local = datetime.now(LOCAL_TZ)
+    if dtime(17, 0) <= now_local.time() < dtime(22, 30):
+        jq.run_once(
+            job_azkar_masa_catchup,
+            when=5,
+            name="azkar_masa_catchup",
+        )
+
+    print(f"✅ الذاكرة الدائمة تعمل على: {MEMORY_FILE}")
+    print("✅ تم تسجيل الوظائف اليومية والمنشور الخاص لمرة واحدة.")
 
 
 # ============================================================
