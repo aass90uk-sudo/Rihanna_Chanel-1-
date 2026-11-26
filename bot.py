@@ -2,15 +2,15 @@ import os
 import asyncio
 import json
 import hashlib
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from pathlib import Path
 
 import httpx
 from pytz import timezone
 from hijri_converter import Gregorian
-from telegram import Update, Bot
+from telegram import Bot
 from telegram.error import BadRequest
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, ContextTypes
 
 
 # ============================================================
@@ -20,10 +20,9 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
-DISCUSSION_GROUP_ID = os.getenv("DISCUSSION_GROUP_ID")
 
 SUPABASE_URL = (
     os.getenv("SUPABASE_URL")
@@ -317,7 +316,7 @@ def _grok_chat(
         with httpx.Client(timeout=120) as client:
             response = client.post(GROQ_API_URL, headers=headers, json=payload)
 
-            if response.status_code >= 400 and response.status_code == 400:
+            if response.status_code in (400, 404):
                 try:
                     error_body = response.json()
                 except ValueError:
@@ -444,64 +443,6 @@ async def generate_content(prompt_type):
                 print(f"⚠️ تعذر Groq ({error})، سيتم استخدام المحتوى الجاهز لـ {prompt_type}.")
                 return fallback
         raise
-
-
-# ============================================================
-# الرد على التعليقات
-# ============================================================
-
-def _sync_fiqh_reply(user_name, user_text):
-
-    system_instruction = (
-        "أنت عالم ديني ربّاني وكاتب إيماني بليغ، "
-        "ترد على أسئلة المسلمين بأدب وحكمة، "
-        "وفق الكتاب والسنة دون اختلاق آيات أو أحاديث. "
-        "ابدأ الرد بعبارة مناسبة مثل: "
-        "'نعم أخي الموحد' أو 'نعم أختي الموحدة'. "
-        "اكتب موعظة عن صبر الزوجات عن ازواجهن بسبب غيابهم للجهاد في سبيل الله مترابطة ومؤثرة، "
-        "واجعلها مختصرة وغير مملة، "
-        "بحيث يكون طولها بين 650 و800 حرف تقريباً. "
-        "لا تكرر المقدمة، ولا تضف حشواً، "
-        "واجعل آخر جملة مكتملة المعنى."
-    )
-
-    full_prompt = (
-        f"{system_instruction}\n\n"
-        f"السائل: {user_name or 'الأخ الموحد'}\n"
-        f"السؤال: {user_text}"
-    )
-
-    last_text = ""
-
-    # لا يتم نشر أي رد قصير أو مقطوع.
-    # إذا لم يكن الناتج مناسباً، تتم إعادة المحاولة.
-    for attempt in range(1, 5):
-
-        text = _grok_chat(
-            full_prompt,
-            max_output_tokens=2048,
-        )
-
-        last_text = text
-        text_length = len(text)
-
-        # المجال المقصود: 650 إلى 800 حرف.
-        if 650 <= text_length <= 800:
-            print(
-                f"✅ موعظة مكتملة: {text_length} حرف "
-                f"| محاولة {attempt}"
-            )
-            return text
-
-        print(
-            f"⚠️ طول غير مناسب: {text_length} حرف "
-            f"| محاولة {attempt}/4"
-        )
-
-    raise RuntimeError(
-        "تعذر إنشاء موعظة مكتملة بالطول المطلوب. "
-        f"آخر طول: {len(last_text)} حرف."
-    )
 
 
 # ============================================================
@@ -633,79 +574,6 @@ async def job_stories_masa(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# الرد على التعليقات
-# ============================================================
-
-async def reply_to_member(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if (
-        not message
-        or not message.text
-        or not message.from_user
-        or message.from_user.is_bot
-    ):
-        return
-
-    print(
-        f"📩 رسالة واردة من "
-        f"chat_id={message.chat_id} "
-        f"message_id={message.message_id}"
-    )
-
-    user_text = message.text
-    user_name = message.from_user.first_name
-
-    try:
-
-        reply = await asyncio.to_thread(
-            _sync_fiqh_reply,
-            user_name,
-            user_text
-        )
-
-        # حماية إضافية: لا ننشر الرد إذا كان ناقصاً.
-        if not reply or not (650 <= len(reply) <= 800):
-            print(
-                f"⚠️ تم رفض الرد قبل الإرسال: "
-                f"{len(reply) if reply else 0} حرف"
-            )
-            return
-
-        try:
-
-            await message.reply_text(
-                text=reply,
-                parse_mode="Markdown"
-            )
-
-        except BadRequest as error:
-
-            print(
-                "⚠️ تعذر تنسيق الرد بـ Markdown، "
-                f"سيتم إرساله كنص عادي: {error}"
-            )
-
-            await message.reply_text(
-                text=reply
-            )
-
-        print(
-            f"✅ تم نشر الموعظة كاملة "
-            f"({len(reply)} حرف)"
-        )
-
-    except Exception as error:
-        print(
-            f"❌ خطأ في الرد على التعليق: {error}"
-        )
-
-
-# ============================================================
 # ما بعد التهيئة
 # ============================================================
 
@@ -826,20 +694,7 @@ def main():
         .build()
     )
 
-    group_filter = filters.ChatType.GROUPS
-    if DISCUSSION_GROUP_ID:
-        group_filter &= filters.Chat(chat_id=int(DISCUSSION_GROUP_ID))
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND
-            & group_filter,
-            reply_to_member,
-        )
-    )
-
-    print("✅ البوت يستمع للرسائل...")
+    print("✅ البوت مخصص للنشر المجدول فقط، ولن يرد على رسائل المجموعة.")
 
     application.run_polling(
         drop_pending_updates=True
