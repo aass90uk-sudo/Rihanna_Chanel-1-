@@ -32,10 +32,10 @@ VOLUME_MOUNT_PATH = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
 MEMORY_FILE = VOLUME_MOUNT_PATH / "posted_history.json"
 MEMORY_LOCK = asyncio.Lock()
 
-# الطول المطلوب للمنشور: بين 900 و1000 حرف
-POST_MIN_CHARS = 900
+# الطول المتوسط المطلوب للمنشور: بين 800 و1000 حرف
+POST_MIN_CHARS = 800
 POST_MAX_CHARS = 1000
-POST_TARGET_CHARS = 950
+POST_TARGET_CHARS = 900
 
 
 # ============================================================
@@ -251,7 +251,7 @@ def _post_system_instruction(prompt_type: str) -> str:
     return (
         "أنت كاتب إيماني بليغ وذو أسلوب شعري هادئ وعميق. "
         "اكتب منشوراً متكاملاً غير مبتور، "
-        "بطول يتراوح بين 900 و1000 حرف تقريباً (الهدف نحو 950 حرفاً)، "
+        "بطول متوسط يتراوح بين 800 و1000 حرف تقريباً (الهدف نحو 900 حرف)، "
         "بحيث تكون آخر جملة مكتملة المعنى دون حشو أو إطناب. "
         "ابتعد عن التكرار والقوالب الجاهزة المستهلكة، "
         "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
@@ -429,7 +429,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
             print(f"⚠️ منشور مكرر (محاولة {attempt}/4)، سيتم طلب نص جديد.")
             continue
 
-        # المجال المقصود: 900 إلى 1000 حرف تقريباً.
+        # المجال المتوسط المقصود: 800 إلى 1000 حرف تقريباً.
         if POST_MIN_CHARS <= text_length <= POST_MAX_CHARS:
             print(f"✅ منشور كامل جديد: {text_length} حرف | محاولة {attempt}")
             return text
@@ -442,7 +442,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
 
         print(f"⚠️ طول غير مناسب: {text_length} حرف | محاولة {attempt}/4")
 
-    # كمحل أخير، نُخرج أطول نص وصلنا إليه غير مكرر ومكتمل الجُمل.
+    # كمحل أخير، نُخرج آخر نص غير مكرر بدلاً من إلغاء المنشور بالكامل.
     if content_hash(last_text) not in known_hashes:
         if len(last_text) > POST_MAX_CHARS:
             last_text = _trim_to_complete_sentence(last_text, POST_TARGET_CHARS)
