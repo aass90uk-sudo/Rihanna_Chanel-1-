@@ -27,6 +27,7 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 LOCAL_TZ = timezone("Asia/Riyadh")
+ALGERIA_TZ = timezone("Africa/Algiers")
 CONTENT_FILE = Path("content.json")
 VOLUME_MOUNT_PATH = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
 MEMORY_FILE = VOLUME_MOUNT_PATH / "posted_history.json"
@@ -234,11 +235,26 @@ async def _memory_release_claim(h_hash: str, prompt_type: str):
 # ============================================================
 
 def _post_system_instruction(prompt_type: str) -> str:
-    story_rule = ""
+    style_rule = ""
     if prompt_type == "stories_masa":
-        story_rule = (
+        style_rule = (
             "قصة من التراث الأندلسي الصالح، "
             "ولا تذكر نسبها إلى الجزائر أو تسميها قصة المساء أو التراث الجزائري، "
+        )
+    elif prompt_type == "qiyam_layl":
+        style_rule = (
+            "اكتب باللهجة الجزائرية الدارجة المفهومة والمحترمة، مع الحفاظ على روح إيمانية صادقة. "
+            "لا تنسب حديثاً أو فضلاً محدداً إلى النبي صلى الله عليه وسلم دون يقين. "
+        )
+    elif prompt_type == "mawiza_20":
+        style_rule = (
+            "اكتب موعظة إيمانية عميقة وهادئة ومطمئنة بأسلوب أدبي قريب من منشورات القناة، "
+            "واجعلها مناسبة للنشر المسائي وتترك في القلب أملاً وسكينة. "
+        )
+    elif prompt_type == "mawiza_08":
+        style_rule = (
+            "اكتب موعظة إيمانية عميقة وهادئة ومطمئنة بأسلوب أدبي قريب من منشورات القناة، "
+            "واجعلها مناسبة لبداية النهار وتملأ القلب أملاً ورضاً وعزيمة هادئة. "
         )
 
     return (
@@ -250,7 +266,7 @@ def _post_system_instruction(prompt_type: str) -> str:
         "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
         "ولا تُلحق المنشور بأي تاريخ أو هجري أو خاتمة خارجية. "
         "اكتب النص plain text فقط دون نجوم أو علامات Markdown أو عناوين مزخرفة. "
-        + story_rule
+        + style_rule
     )
 
 
@@ -266,6 +282,15 @@ PROMPTS = {
 
     "stories_masa":
         "اكتب قصة ملهمة من التراث الأندلسي القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ، واختمها بـ (العبرة من القصة:).",
+
+    "qiyam_layl":
+        "اكتب تذكيراً يومياً بقيام الليل باللهجة الجزائرية الدارجة، يشجع بلطف على ركعتين أو أكثر والدعاء في هدوء الليل، دون تخويف أو مبالغة.",
+
+    "mawiza_20":
+        "اكتب موعظة إيمانية عميقة وهادئة ومطمئنة عن موضوع متجدد كل يوم، مثل الرجاء بالله أو جبر القلوب أو الصبر أو التوبة أو أثر الدعاء، واجعلها قريبة من الناس.",
+
+    "mawiza_08":
+        "اكتب موعظة إيمانية صباحية عميقة وهادئة ومطمئنة عن موضوع متجدد كل يوم، مثل بداية جديدة أو حسن الظن بالله أو الشكر أو السعي الطيب، واجعلها قريبة من الناس.",
 }
 
 
@@ -584,6 +609,30 @@ async def job_stories_masa(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def job_qiyam_layl(context: ContextTypes.DEFAULT_TYPE):
+    await send_daily_post(
+        context.bot,
+        "qiyam_layl",
+        "تذكير قيام الليل"
+    )
+
+
+async def job_mawiza_20(context: ContextTypes.DEFAULT_TYPE):
+    await send_daily_post(
+        context.bot,
+        "mawiza_20",
+        "الموعظة الإيمانية المسائية"
+    )
+
+
+async def job_mawiza_08(context: ContextTypes.DEFAULT_TYPE):
+    await send_daily_post(
+        context.bot,
+        "mawiza_08",
+        "الموعظة الإيمانية الصباحية"
+    )
+
+
 async def job_special_once(context: ContextTypes.DEFAULT_TYPE):
     await send_special_post(context.bot)
 
@@ -657,6 +706,24 @@ async def post_init(application: Application):
         job_stories_masa,
         time=dtime(22, 30, tzinfo=tz),
         name="stories_masa"
+    )
+
+    jq.run_daily(
+        job_qiyam_layl,
+        time=dtime(2, 0, tzinfo=ALGERIA_TZ),
+        name="qiyam_layl_algeria"
+    )
+
+    jq.run_daily(
+        job_mawiza_20,
+        time=dtime(20, 0, tzinfo=ALGERIA_TZ),
+        name="mawiza_20_algeria"
+    )
+
+    jq.run_daily(
+        job_mawiza_08,
+        time=dtime(8, 0, tzinfo=ALGERIA_TZ),
+        name="mawiza_08_algeria"
     )
 
     jq.run_once(
