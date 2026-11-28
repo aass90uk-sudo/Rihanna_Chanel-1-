@@ -32,12 +32,6 @@ VOLUME_MOUNT_PATH = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
 MEMORY_FILE = VOLUME_MOUNT_PATH / "posted_history.json"
 MEMORY_LOCK = asyncio.Lock()
 
-# الطول المتوسط المطلوب للمنشور: بين 800 و1000 حرف
-POST_MIN_CHARS = 800
-POST_MAX_CHARS = 1000
-POST_TARGET_CHARS = 900
-
-
 # ============================================================
 # أدوات مساعدة
 # ============================================================
@@ -250,9 +244,7 @@ def _post_system_instruction(prompt_type: str) -> str:
 
     return (
         "أنت كاتب إيماني بليغ وذو أسلوب شعري هادئ وعميق. "
-        "اكتب منشوراً متكاملاً غير مبتور، "
-        "بطول متوسط يتراوح بين 800 و1000 حرف تقريباً (الهدف نحو 900 حرف)، "
-        "بحيث تكون آخر جملة مكتملة المعنى دون حشو أو إطناب. "
+        "اكتب منشوراً متكاملاً غير مبتور، بحيث تكون آخر جملة مكتملة المعنى دون حشو أو إطناب. "
         "ابتعد عن التكرار والقوالب الجاهزة المستهلكة، "
         "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
         "ولا تُلحق المنشور بأي تاريخ أو هجري أو خاتمة خارجية. "
@@ -326,7 +318,6 @@ def _grok_output_text(response_data: dict) -> str:
 def _grok_chat(
     prompt_text: str,
     system_instruction: str | None = None,
-    max_output_tokens: int = 2048,
 ) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("المتغير GROQ_API_KEY غير مضبوط في Railway.")
@@ -340,7 +331,6 @@ def _grok_chat(
         "model": GROQ_MODEL,
         "messages": input_messages,
         "temperature": 0.9,
-        "max_tokens": max_output_tokens,
     }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -401,58 +391,22 @@ def _grok_chat(
     return text
 
 
-def _trim_to_complete_sentence(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    cut = text[:max_chars]
-    last_stop = max(cut.rfind("."), cut.rfind("؟"), cut.rfind("!"), cut.rfind("\n"))
-    if last_stop > max_chars // 2:
-        return cut[:last_stop + 1].strip()
-    return cut.strip()
-
-
 def _sync_generate_post(prompt_text, prompt_type, known_hashes):
-    # لا يتم نشر أي منشور مقصوص أو مكرر.
-    # إذا لم يكن الناتج مناسباً، تتم إعادة المحاولة.
-    last_text = ""
     for attempt in range(1, 5):
         text = _grok_chat(
             prompt_text,
             system_instruction=_post_system_instruction(prompt_type),
-            max_output_tokens=2048,
         )
         text = _clean_post_text(text)
-        last_text = text
-        text_length = len(text)
 
         if content_hash(text) in known_hashes:
             print(f"⚠️ منشور مكرر (محاولة {attempt}/4)، سيتم طلب نص جديد.")
             continue
 
-        # المجال المتوسط المقصود: 800 إلى 1000 حرف تقريباً.
-        if POST_MIN_CHARS <= text_length <= POST_MAX_CHARS:
-            print(f"✅ منشور كامل جديد: {text_length} حرف | محاولة {attempt}")
-            return text
+        print(f"✅ منشور جديد | محاولة {attempt}")
+        return text
 
-        if POST_MAX_CHARS < text_length:
-            trimmed = _trim_to_complete_sentence(text, POST_TARGET_CHARS)
-            if POST_MIN_CHARS <= len(trimmed) <= POST_MAX_CHARS:
-                print(f"✅ تم تشذيب منشور طويل إلى {len(trimmed)} حرف | محاولة {attempt}")
-                return trimmed
-
-        print(f"⚠️ طول غير مناسب: {text_length} حرف | محاولة {attempt}/4")
-
-    # كمحل أخير، نُخرج آخر نص غير مكرر بدلاً من إلغاء المنشور بالكامل.
-    if content_hash(last_text) not in known_hashes:
-        if len(last_text) > POST_MAX_CHARS:
-            last_text = _trim_to_complete_sentence(last_text, POST_TARGET_CHARS)
-        print(f"⚠️ إرجاع أفضل نص متاح بعد المحاولات: {len(last_text)} حرف.")
-        return last_text
-
-    raise RuntimeError(
-        "تعذر إنشاء منشور جديد غير مكرر بالطول المطلوب. "
-        f"آخر طول: {len(last_text)} حرف."
-    )
+    raise RuntimeError("تعذر إنشاء منشور جديد غير مكرر بعد عدة محاولات.")
 
 
 async def generate_content(prompt_type):
