@@ -14,11 +14,9 @@ from hijri_converter import Gregorian
 from telegram import Bot
 from telegram.ext import Application, ContextTypes
 
-
 # ============================================================
 # الإعدادات البيئية
 # ============================================================
-
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -28,23 +26,21 @@ GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 LOCAL_TZ = timezone("Asia/Riyadh")
 ALGERIA_TZ = timezone("Africa/Algiers")
+
 CONTENT_FILE = Path("content.json")
 VOLUME_MOUNT_PATH = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
 MEMORY_FILE = VOLUME_MOUNT_PATH / "posted_history.json"
 MEMORY_LOCK = asyncio.Lock()
-SPECIAL_POST_TYPE = "special_tamanrasset"
-SPECIAL_POST_KEY = "special_tamanrasset_once"
 
-# الطول المطلوب للمنشور: وسط تقريباً (1200 حرف)
-POST_MIN_CHARS = 1100
-POST_MAX_CHARS = 1300
-POST_TARGET_CHARS = 1200
+# الطول المطلوب للمنشور: بين 900 و1000 حرف
+POST_MIN_CHARS = 900
+POST_MAX_CHARS = 1000
+POST_TARGET_CHARS = 950
 
 
 # ============================================================
 # أدوات مساعدة
 # ============================================================
-
 def get_hijri_date():
     now_local = datetime.now(LOCAL_TZ)
     hijri = Gregorian(
@@ -52,7 +48,6 @@ def get_hijri_date():
         now_local.month,
         now_local.day
     ).to_hijri()
-
     months = [
         "محرم",
         "صفر",
@@ -67,7 +62,6 @@ def get_hijri_date():
         "ذو القعدة",
         "ذو الحجة",
     ]
-
     return f"📅 {hijri.day} {months[hijri.month - 1]} {hijri.year} هـ"
 
 
@@ -80,9 +74,7 @@ def _clean_post_text(text: str) -> str:
     cleaned = re.sub(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]", "", cleaned)
     cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
     cleaned = re.sub(r"([\u064B-\u065F\u0670])\1+", r"\1", cleaned)
-    cleaned = re.sub(r"(?<![\u0621-\u064A])[\u064B-\u065F\u0670]+(?![\u0621-\u064A])", "", cleaned)
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"(?m)^#{1,6}\s*", "", cleaned)
     return cleaned.strip()
 
 
@@ -94,7 +86,6 @@ def content_hash(text: str) -> str:
 # ============================================================
 # الذاكرة الدائمة على Railway Volume
 # ============================================================
-
 def _empty_memory():
     return {"version": 1, "posts": []}
 
@@ -134,6 +125,18 @@ def _save_memory(memory):
         raise RuntimeError(f"تعذر حفظ الذاكرة الدائمة داخل Volume: {error}") from error
 
 
+async def _memory_has_posted_today(prompt_type: str) -> bool:
+    today_key = f"{prompt_type}:{datetime.now(LOCAL_TZ).date().isoformat()}"
+    async with MEMORY_LOCK:
+        memory = _load_memory()
+        return any(
+            isinstance(record, dict)
+            and record.get("claim_key") == today_key
+            and record.get("status") == "posted"
+            for record in memory["posts"]
+        )
+
+
 async def _memory_known_hashes(prompt_type: str) -> set[str]:
     async with MEMORY_LOCK:
         memory = _load_memory()
@@ -147,18 +150,6 @@ async def _memory_known_hashes(prompt_type: str) -> set[str]:
         }
 
 
-async def _memory_has_posted_today(prompt_type: str) -> bool:
-    today_key = f"{prompt_type}:{datetime.now(LOCAL_TZ).date().isoformat()}"
-    async with MEMORY_LOCK:
-        memory = _load_memory()
-        return any(
-            isinstance(record, dict)
-            and record.get("claim_key") == today_key
-            and record.get("status") == "posted"
-            for record in memory["posts"]
-        )
-
-
 async def _memory_claim_post(
     h_hash: str,
     prompt_type: str,
@@ -167,6 +158,7 @@ async def _memory_claim_post(
 ) -> bool:
     async with MEMORY_LOCK:
         memory = _load_memory()
+
         already_claimed = any(
             isinstance(record, dict)
             and record.get("claim_key") == claim_key
@@ -233,7 +225,6 @@ async def _memory_release_claim(h_hash: str, prompt_type: str):
 # ============================================================
 # أوامر المحتوى
 # ============================================================
-
 def _post_system_instruction(prompt_type: str) -> str:
     style_rule = ""
     if prompt_type == "stories_masa":
@@ -260,7 +251,7 @@ def _post_system_instruction(prompt_type: str) -> str:
     return (
         "أنت كاتب إيماني بليغ وذو أسلوب شعري هادئ وعميق. "
         "اكتب منشوراً متكاملاً غير مبتور، "
-        "بطول يتراوح بين 1100 و1300 حرف تقريباً (الهدف نحو 1200 حرف)، "
+        "بطول يتراوح بين 900 و1000 حرف تقريباً (الهدف نحو 950 حرفاً)، "
         "بحيث تكون آخر جملة مكتملة المعنى دون حشو أو إطناب. "
         "ابتعد عن التكرار والقوالب الجاهزة المستهلكة، "
         "وغيّر المقدمات والأساليب والصور التعبيرية في كل مرة، "
@@ -273,44 +264,24 @@ def _post_system_instruction(prompt_type: str) -> str:
 PROMPTS = {
     "azkar_sabah":
         "اكتب منشوراً صباحياً يحتوي على أحد أذكار الصباح وفضلها بنبرة إيمانية دافئة وشرح موجز.",
-
     "stories_sabah":
         "اكتب قصة إسلامية جهادية مؤثرة وقعت في بلاد المغرب الإسلامي وعبرة مأثورة ملهمة، واختمها بـ (العبرة من القصة:).",
-
     "azkar_masa":
         "اكتب منشوراً مسائياً مؤثراً يحتوي على أحد أذكار المساء المأثورة وفضلها وشرح موجز لها.",
-
     "stories_masa":
         "اكتب قصة ملهمة من التراث الأندلسي القديم والصالحين في المغرب الأوسط والأندلس مليئة بالعبر والمواعظ، واختمها بـ (العبرة من القصة:).",
-
     "qiyam_layl":
         "اكتب تذكيراً يومياً بقيام الليل باللهجة الجزائرية الدارجة، يشجع بلطف على ركعتين أو أكثر والدعاء في هدوء الليل، دون تخويف أو مبالغة.",
-
     "mawiza_20":
         "اكتب موعظة إيمانية عميقة وهادئة ومطمئنة عن موضوع متجدد كل يوم، مثل الرجاء بالله أو جبر القلوب أو الصبر أو التوبة أو أثر الدعاء، واجعلها قريبة من الناس.",
-
     "mawiza_08":
         "اكتب موعظة إيمانية صباحية عميقة وهادئة ومطمئنة عن موضوع متجدد كل يوم، مثل بداية جديدة أو حسن الظن بالله أو الشكر أو السعي الطيب، واجعلها قريبة من الناس.",
 }
 
 
-SPECIAL_POST_TEXT = (
-    "في بعض الليالي يمرّ الحزن على القلوب ثقيلاً، فنحتاج أن نتذكر أن الله أرحم بنا من أنفسنا، "
-    "وأن رحمته لا يغلقها موت ولا يحدّها ألم. إنّا لله وإنّا إليه راجعون، ولا نقول إلا ما يرضي ربنا.\n\n"
-    "اللهم ارحم ضحايا حادث السير الأليم في تمنراست، واغفر لهم، ونوّر قبورهم، واجعل ما أصابهم رفعةً "
-    "في درجاتهم وتكفيراً لذنوبهم. اللهم اربط على قلوب أهليهم، وأنزل عليهم سكينتك وصبرك الجميل، "
-    "واجبر كسرهم جبراً يليق بكرمك. اللهم اشف المصابين شفاءً تاماً، وألطف بهم، وردّهم إلى أهلهم سالمين معافين.\n\n"
-    "يا من أثقلتك مصيبة أو أوجعك فراق، لا تظن أن دمعتك غائبة عن علم الله؛ هو يسمع الدعاء قبل أن تنطق به، "
-    "ويرى القلب حين لا يراه أحد. فاهدأ، واستودع أحبابك عند أرحم الراحمين، وأكثر من قول: "
-    "اللهم آجرنا في مصيبتنا واخلف لنا خيراً منها. سيأتي لطف الله، ولو بعد حين، وسيجعل في الصبر نوراً "
-    "وفي التسليم طمأنينةً لا يمنحها شيء سواه."
-)
-
-
 # ============================================================
 # المحتوى الاحتياطي وحالة التشغيل
 # ============================================================
-
 def _load_fallback_content():
     try:
         with CONTENT_FILE.open("r", encoding="utf-8") as content_file:
@@ -318,7 +289,6 @@ def _load_fallback_content():
     except (OSError, json.JSONDecodeError) as error:
         print(f"⚠️ تعذر تحميل المحتوى الاحتياطي: {error}")
         return {}
-
     return content if isinstance(content, dict) else {}
 
 
@@ -326,7 +296,6 @@ def _fallback_content(prompt_type):
     values = _load_fallback_content().get(prompt_type, [])
     if not isinstance(values, list) or not values:
         return None
-
     today_index = datetime.now(LOCAL_TZ).timetuple().tm_yday % len(values)
     value = values[today_index]
     return _clean_post_text(value) if isinstance(value, str) and value.strip() else None
@@ -335,7 +304,6 @@ def _fallback_content(prompt_type):
 # ============================================================
 # Grok
 # ============================================================
-
 def _grok_output_text(response_data: dict) -> str:
     direct_text = response_data.get("output_text")
     if isinstance(direct_text, str) and direct_text.strip():
@@ -352,7 +320,6 @@ def _grok_output_text(response_data: dict) -> str:
         message = choice.get("message", {})
         if isinstance(message, dict) and isinstance(message.get("content"), str):
             text_parts.append(message["content"])
-
     return "".join(text_parts).strip()
 
 
@@ -389,7 +356,6 @@ def _grok_chat(
                     error_body = response.json()
                 except ValueError:
                     error_body = {}
-
                 error_details = error_body.get("error") if isinstance(error_body, dict) else None
                 if isinstance(error_details, dict) and error_details.get("code") == "model_not_found":
                     available_response = client.get(GROQ_MODELS_URL, headers=headers)
@@ -432,7 +398,6 @@ def _grok_chat(
     text = _grok_output_text(response_data)
     if not text:
         raise RuntimeError("أعاد Groq نصاً فارغاً.")
-
     return text
 
 
@@ -450,15 +415,12 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
     # لا يتم نشر أي منشور مقصوص أو مكرر.
     # إذا لم يكن الناتج مناسباً، تتم إعادة المحاولة.
     last_text = ""
-
     for attempt in range(1, 5):
-
         text = _grok_chat(
             prompt_text,
             system_instruction=_post_system_instruction(prompt_type),
             max_output_tokens=2048,
         )
-
         text = _clean_post_text(text)
         last_text = text
         text_length = len(text)
@@ -467,7 +429,7 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
             print(f"⚠️ منشور مكرر (محاولة {attempt}/4)، سيتم طلب نص جديد.")
             continue
 
-        # المجال المقصود: 1100 إلى 1300 حرف تقريباً.
+        # المجال المقصود: 900 إلى 1000 حرف تقريباً.
         if POST_MIN_CHARS <= text_length <= POST_MAX_CHARS:
             print(f"✅ منشور كامل جديد: {text_length} حرف | محاولة {attempt}")
             return text
@@ -496,7 +458,6 @@ def _sync_generate_post(prompt_text, prompt_type, known_hashes):
 async def generate_content(prompt_type):
     known_hashes = await _memory_known_hashes(prompt_type)
     prompt_text = PROMPTS[prompt_type]
-
     try:
         return await asyncio.to_thread(
             _sync_generate_post,
@@ -517,7 +478,6 @@ async def generate_content(prompt_type):
 # ============================================================
 # إرسال المنشورات للقناة
 # ============================================================
-
 async def _send_claimed_post(
     bot: Bot,
     prompt_type: str,
@@ -558,25 +518,9 @@ async def send_daily_post(
         return False
 
 
-async def send_special_post(bot: Bot) -> bool:
-    try:
-        print("📤 الموعظة الخاصة والدعاء لأهالي حادث تمنراست...")
-        return await _send_claimed_post(
-            bot,
-            SPECIAL_POST_TYPE,
-            "الموعظة الخاصة والدعاء لأهالي حادث تمنراست",
-            SPECIAL_POST_TEXT,
-            SPECIAL_POST_KEY,
-        )
-    except Exception as error:
-        print(f"❌ خطأ في المنشور الخاص: {error}")
-        return False
-
-
 # ============================================================
 # وظائف JobQueue
 # ============================================================
-
 async def job_azkar_sabah(context: ContextTypes.DEFAULT_TYPE):
     await send_daily_post(
         context.bot,
@@ -633,93 +577,74 @@ async def job_mawiza_08(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def job_special_once(context: ContextTypes.DEFAULT_TYPE):
-    await send_special_post(context.bot)
-
-
-async def job_azkar_masa_catchup(context: ContextTypes.DEFAULT_TYPE):
-    if await _memory_has_posted_today("azkar_masa"):
-        print("✅ أذكار المساء منشورة اليوم، لا حاجة لمنشور تعويضي.")
+async def job_qiyam_layl_startup_once(context: ContextTypes.DEFAULT_TYPE):
+    # نشر لمرة واحدة عند التشغيل، لأن موعد التذكير المجدول قد يكون قد فات.
+    if await _memory_has_posted_today("qiyam_layl"):
+        print("✅ تذكير قيام الليل منشور اليوم، لا حاجة لنشره الآن.")
         return
-    await job_azkar_masa(context)
+    await send_daily_post(context.bot, "qiyam_layl", "تذكير قيام الليل (عند التشغيل)")
 
 
 # ============================================================
 # ما بعد التهيئة
 # ============================================================
-
 async def post_init(application: Application):
-
     bot = application.bot
     jq = application.job_queue
 
     try:
-
         bot_info = await bot.get_me()
-
         channel = await bot.get_chat(
             CHANNEL_ID
         )
-
         channel_member = await bot.get_chat_member(
             channel.id,
             bot_info.id
         )
-
         print(
             f"✅ Telegram متصل: @{bot_info.username} | "
             f"القناة: {channel.title or channel.id} | "
             f"حالة البوت: {channel_member.status}"
         )
-
     except Exception as error:
-
         print(
             "⚠️ تعذر التحقق من اتصال Telegram "
             f"أو صلاحيات القناة: {error}"
         )
 
     # الوظائف اليومية الثابتة
-    # توقيت مكة = Asia/Riyadh
-
+    # عند إعادة التشغيل لا يُنشر أي شيء فوراً، بل ينتظر البوت موعده المجدول التالي.
     tz = LOCAL_TZ
-
     jq.run_daily(
         job_azkar_sabah,
         time=dtime(6, 0, tzinfo=tz),
         name="azkar_sabah"
     )
-
     jq.run_daily(
         job_stories_sabah,
         time=dtime(12, 0, tzinfo=tz),
         name="stories_sabah"
     )
-
     jq.run_daily(
         job_azkar_masa,
         time=dtime(17, 0, tzinfo=tz),
         name="azkar_masa"
     )
-
     jq.run_daily(
         job_stories_masa,
         time=dtime(22, 30, tzinfo=tz),
         name="stories_masa"
     )
-
     jq.run_daily(
         job_qiyam_layl,
         time=dtime(2, 0, tzinfo=ALGERIA_TZ),
         name="qiyam_layl_algeria"
     )
-
     jq.run_daily(
         job_mawiza_20,
         time=dtime(20, 0, tzinfo=ALGERIA_TZ),
         name="mawiza_20_algeria"
     )
-
     jq.run_daily(
         job_mawiza_08,
         time=dtime(8, 0, tzinfo=ALGERIA_TZ),
@@ -727,29 +652,19 @@ async def post_init(application: Application):
     )
 
     jq.run_once(
-        job_special_once,
+        job_qiyam_layl_startup_once,
         when=10,
-        name=SPECIAL_POST_KEY,
+        name="qiyam_layl_startup_once",
     )
 
-    now_local = datetime.now(LOCAL_TZ)
-    if dtime(17, 0) <= now_local.time() < dtime(22, 30):
-        jq.run_once(
-            job_azkar_masa_catchup,
-            when=5,
-            name="azkar_masa_catchup",
-        )
-
     print(f"✅ الذاكرة الدائمة تعمل على: {MEMORY_FILE}")
-    print("✅ تم تسجيل الوظائف اليومية والمنشور الخاص لمرة واحدة.")
+    print("✅ تم تسجيل الوظائف اليومية + تذكير قيام الليل لمرة واحدة عند التشغيل.")
 
 
 # ============================================================
 # نقطة الانطلاق
 # ============================================================
-
 def main():
-
     print("🚀 بدء تشغيل البوت...")
 
     application = (
@@ -760,7 +675,6 @@ def main():
     )
 
     print("✅ البوت مخصص للنشر المجدول فقط، ولن يرد على رسائل المجموعة.")
-
     application.run_polling(
         drop_pending_updates=True
     )
